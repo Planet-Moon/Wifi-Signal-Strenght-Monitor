@@ -10,6 +10,8 @@ pub enum Event {
     Quit,
     SelectPrev,
     SelectNext,
+    SelectColPrev,
+    SelectColNext,
     WifiScanned(WifiScanResult),
 }
 
@@ -19,8 +21,8 @@ fn handle_key_event(
 ) -> color_eyre::Result<()> {
     match key_event.code {
         KeyCode::Char('q') => tx.send(Event::Quit)?,
-        KeyCode::Left => todo!(),
-        KeyCode::Right => todo!(),
+        KeyCode::Left => tx.send(Event::SelectColPrev)?,
+        KeyCode::Right => tx.send(Event::SelectColNext)?,
         KeyCode::Up => tx.send(Event::SelectPrev)?,
         KeyCode::Down => tx.send(Event::SelectNext)?,
         _ => {}

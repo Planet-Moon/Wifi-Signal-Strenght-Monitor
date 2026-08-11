@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 use std::thread::{self, sleep};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Style, Stylize};
@@ -25,11 +25,11 @@ impl Datapoint {
     }
 }
 
-impl Into<(f64, f64)> for Datapoint {
-    fn into(self) -> (f64, f64) {
+impl From<Datapoint> for (f64, f64) {
+    fn from(value: Datapoint) -> Self {
         (
-            self.timestamp.elapsed().unwrap().as_secs_f64(),
-            self.signal_strength as f64,
+            value.timestamp.elapsed().unwrap().as_secs_f64(),
+            value.signal_strength as f64,
         )
     }
 }
@@ -49,28 +49,23 @@ impl DataPointContainer {
             0 | 1 => None,
             _ => Some([
                 self.data
-                    .iter()
-                    .rev()
-                    .next()
+                    .last()
                     .unwrap()
                     .timestamp
                     .elapsed()
                     .unwrap()
-                    .as_secs_f64(),
+                    .as_secs_f64()
+                    - 1.0,
                 self.data
-                    .iter()
-                    .next()
+                    .first()
                     .unwrap()
                     .timestamp
                     .elapsed()
                     .unwrap()
-                    .as_secs_f64(),
+                    .as_secs_f64()
+                    + 1.0,
             ]),
         }
-    }
-
-    fn get_limits_y(&self) -> (f64, f64) {
-        todo!()
     }
 
     fn push(&mut self, value: i32) {
@@ -163,10 +158,10 @@ impl App {
             }
             Event::WifiScanned(v) => {
                 self.detected_wifis = v;
-                if let Ok(w) = &self.detected_wifis.wifi {
-                    if let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch")) {
-                        self.chart_data.push(a.signal_level);
-                    }
+                if let Ok(w) = &self.detected_wifis.wifi
+                    && let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch"))
+                {
+                    self.chart_data.push(a.signal_level);
                 }
                 None
             }
@@ -182,9 +177,6 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let block = Block::bordered()
-            .title("Bordered block")
-            .title_bottom("Title bottom");
         let mut items = match &self.detected_wifis.wifi {
             Ok(wifi) => wifi
                 .iter()
@@ -252,12 +244,12 @@ impl App {
             .column_highlight_style(Style::new().red())
             .cell_highlight_style(Style::new().blue())
             .highlight_symbol(">>");
-        // frame.render_widget(block, chart_);
         frame.render_stateful_widget(table, table_, &mut self.table_state);
 
         let data = self.chart_data.get_data().clone();
         let m = data
             .into_iter()
+            .rev()
             .map(|d| d.into())
             .collect::<Vec<(f64, f64)>>();
         let datasets = vec![

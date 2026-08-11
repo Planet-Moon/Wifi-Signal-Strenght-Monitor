@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use wifi_scan::Wifi;
 
@@ -126,17 +126,20 @@ impl App {
         let chart_ = layout[1];
 
         let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
-            Ok(wifi) => wifi
-                .iter()
-                .map(|e| {
-                    Row::new(vec![
-                        e.ssid.to_string(),
-                        e.mac.to_string(),
-                        e.channel.to_string(),
-                        e.signal_level.to_string(),
-                    ])
-                })
-                .collect::<Vec<Row>>(),
+            Ok(wifi) => {
+                let mut w = wifi.clone();
+                w.sort_by_key(|b| std::cmp::Reverse(b.signal_level));
+                w.into_iter()
+                    .map(|e| {
+                        Row::new(vec![
+                            e.ssid.to_string(),
+                            e.mac.to_string(),
+                            e.channel.to_string(),
+                            e.signal_level.to_string(),
+                        ])
+                    })
+                    .collect::<Vec<Row>>()
+            }
             Err(_) => Vec::new(),
         };
         let widths = [

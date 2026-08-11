@@ -2,11 +2,10 @@ use std::sync::mpsc;
 use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime};
 
-use ratatui::layout::{self, Constraint, Direction, Layout};
-use ratatui::prelude::Stylize;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListState, Row, Table, TableState};
-use ratatui::{DefaultTerminal, Frame, text::Line, widgets::Widget};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::Style;
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, TableState};
+use ratatui::{DefaultTerminal, Frame};
 use wifi_scan::Wifi;
 
 use crate::event::Event;
@@ -14,7 +13,7 @@ use crate::event::Event;
 #[derive(Debug)]
 pub struct WifiScanResult {
     timestamp: std::time::SystemTime,
-    wifi: Vec<Wifi>,
+    wifi: Result<Vec<Wifi>, String>,
 }
 
 #[derive(Debug)]
@@ -36,7 +35,7 @@ impl App {
             table_state: TableState::default().with_selected(Some(0)),
             detected_wifis: WifiScanResult {
                 timestamp: SystemTime::now(),
-                wifi: Vec::new(),
+                wifi: Ok(Vec::new()),
             },
         }
     }
@@ -50,10 +49,11 @@ impl App {
             let event_tx = self.event_tx.clone();
             move || {
                 loop {
+                    let wifi_scan_result = wifi_scan::scan();
                     event_tx
                         .send(Event::WifiScanned(WifiScanResult {
                             timestamp: SystemTime::now(),
-                            wifi: wifi_scan::scan().unwrap_or(vec![]),
+                            wifi: wifi_scan_result.map_err(|e| e.to_string()),
                         }))
                         .unwrap();
                     sleep(Duration::from_millis(200));
@@ -62,10 +62,10 @@ impl App {
         });
         while !self.exit {
             terminal.draw(|f| self.draw(f))?;
-            if let Ok(event) = self.event_rx.recv() {
-                if let Some(new) = self.handle_event(event) {
-                    new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
-                }
+            if let Ok(event) = self.event_rx.recv()
+                && let Some(new) = self.handle_event(event)
+            {
+                new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
             }
         }
         Ok(())
@@ -101,16 +101,22 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let block = Block::bordered().title("Bordered block");
-        let mut items = self
-            .detected_wifis
-            .wifi
-            .iter()
-            .map(|e| format!("{}", e.ssid))
-            .collect::<Vec<String>>();
+        let block = Block::bordered()
+            .title("Bordered block")
+            .title_bottom("Title bottom");
+        let mut items = match &self.detected_wifis.wifi {
+            Ok(wifi) => wifi
+                .iter()
+                .map(|e| e.ssid.to_string())
+                .collect::<Vec<String>>(),
+            Err(e) => {
+                vec![e.clone()]
+            }
+        };
+
         let ts = time_format::from_system_time(self.detected_wifis.timestamp).unwrap();
         let formatted_time = time_format::format_iso8601_local(ts).unwrap();
-        items.push(format!("{formatted_time}"));
+        items.push(formatted_time.to_string());
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -119,28 +125,20 @@ impl App {
         let table_ = layout[0];
         let chart_ = layout[1];
 
-        let table_rows = [Row::new(vec!["SSID", "MAC", "Channel", "Signal strength"])];
-        // pub struct Wifi {
-        //     /// MAC Address. May be empty on macOS.
-        //     pub mac: String,
-        //     /// Hotspot Name. May be empty on macOS.
-        //     pub ssid: String,
-        //     /// Channel the hotspot is on. Returns 0 if unknown.
-        //     pub channel: u32,
-        //     /// Wifi signal strength in dBm. Returns 0 if unknown.
-        //     pub signal_level: i32,
-        //     /// A list of all supported securities by the network
-        //     pub security: Vec<WifiSecurity>,
-        // }
-
-        let table_rows = self.detected_wifis.wifi.iter().map(|e| {
-            Row::new(vec![
-                format!("{}", e.ssid),
-                format!("{}", e.mac),
-                format!("{}", e.channel),
-                format!("{}", e.signal_level),
-            ])
-        });
+        let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
+            Ok(wifi) => wifi
+                .iter()
+                .map(|e| {
+                    Row::new(vec![
+                        e.ssid.to_string(),
+                        e.mac.to_string(),
+                        e.channel.to_string(),
+                        e.signal_level.to_string(),
+                    ])
+                })
+                .collect::<Vec<Row>>(),
+            Err(_) => Vec::new(),
+        };
         let widths = [
             Constraint::Min(30),
             Constraint::Min(11),
@@ -148,6 +146,10 @@ impl App {
             Constraint::Min(16),
         ];
 
+        let footer_str = match &self.detected_wifis.wifi {
+            Ok(_) => format!("Updated on {}", formatted_time),
+            Err(e) => format!("Updated on {} | {}", formatted_time, e),
+        };
         let table = Table::new(table_rows, widths)
             .column_spacing(1)
             .style(Style::new().blue())
@@ -156,7 +158,7 @@ impl App {
                     .style(Style::new().bold())
                     .bottom_margin(1),
             )
-            .footer(Row::new(vec![format!("Updated on {}", formatted_time)]))
+            .footer(Row::new(vec![footer_str]))
             .block(
                 Block::new()
                     .title("Wifi networks nearby")

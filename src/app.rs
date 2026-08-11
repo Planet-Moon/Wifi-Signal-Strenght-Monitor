@@ -1,14 +1,88 @@
 use std::sync::mpsc;
 use std::thread::{self, sleep};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Row, Table, TableState};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::style::{Style, Stylize};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Table, TableState};
+use ratatui::{DefaultTerminal, Frame, symbols};
 use wifi_scan::Wifi;
 
 use crate::event::Event;
+
+#[derive(Debug, Clone)]
+struct Datapoint {
+    timestamp: std::time::SystemTime,
+    signal_strength: i32,
+}
+
+impl Datapoint {
+    fn new(value: i32) -> Self {
+        Self {
+            timestamp: std::time::SystemTime::now(),
+            signal_strength: value,
+        }
+    }
+}
+
+impl Into<(f64, f64)> for Datapoint {
+    fn into(self) -> (f64, f64) {
+        (
+            self.timestamp.elapsed().unwrap().as_secs_f64(),
+            self.signal_strength as f64,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct DataPointContainer {
+    data: Vec<Datapoint>,
+}
+
+impl DataPointContainer {
+    fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    fn get_limits_x(&self) -> Option<[f64; 2]> {
+        match self.data.len() {
+            0 | 1 => None,
+            _ => Some([
+                self.data
+                    .iter()
+                    .rev()
+                    .next()
+                    .unwrap()
+                    .timestamp
+                    .elapsed()
+                    .unwrap()
+                    .as_secs_f64(),
+                self.data
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .timestamp
+                    .elapsed()
+                    .unwrap()
+                    .as_secs_f64(),
+            ]),
+        }
+    }
+
+    fn get_limits_y(&self) -> (f64, f64) {
+        todo!()
+    }
+
+    fn push(&mut self, value: i32) {
+        self.data.push(Datapoint::new(value));
+    }
+}
+
+impl<'a> DataPointContainer {
+    fn get_data(&'a self) -> &'a Vec<Datapoint> {
+        &self.data
+    }
+}
 
 #[derive(Debug)]
 pub struct WifiScanResult {
@@ -23,6 +97,7 @@ pub struct App {
     event_tx: mpsc::Sender<Event>,
     table_state: TableState,
     detected_wifis: WifiScanResult,
+    chart_data: DataPointContainer,
 }
 
 impl App {
@@ -37,6 +112,7 @@ impl App {
                 timestamp: SystemTime::now(),
                 wifi: Ok(Vec::new()),
             },
+            chart_data: DataPointContainer::new(),
         }
     }
 
@@ -87,6 +163,11 @@ impl App {
             }
             Event::WifiScanned(v) => {
                 self.detected_wifis = v;
+                if let Ok(w) = &self.detected_wifis.wifi {
+                    if let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch")) {
+                        self.chart_data.push(a.signal_level);
+                    }
+                }
                 None
             }
             Event::SelectColPrev => {
@@ -171,7 +252,45 @@ impl App {
             .column_highlight_style(Style::new().red())
             .cell_highlight_style(Style::new().blue())
             .highlight_symbol(">>");
-        frame.render_widget(block, chart_);
+        // frame.render_widget(block, chart_);
         frame.render_stateful_widget(table, table_, &mut self.table_state);
+
+        let data = self.chart_data.get_data().clone();
+        let m = data
+            .into_iter()
+            .map(|d| d.into())
+            .collect::<Vec<(f64, f64)>>();
+        let datasets = vec![
+            Dataset::default()
+                .name("Wifi signal strengh")
+                .marker(symbols::Marker::Dot)
+                .graph_type(GraphType::Line)
+                .style(Style::default().magenta())
+                .data(&m),
+        ];
+        let x_bounds = self.chart_data.get_limits_x().unwrap_or([0.0, 10.0]);
+        let x_labels = x_bounds
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<String>>();
+        let x_axis = Axis::default()
+            .title("Time".red())
+            .style(Style::default().white())
+            .bounds(x_bounds)
+            .labels(x_labels);
+
+        // Create the Y axis and define its properties
+        let y_axis = Axis::default()
+            .title("Signal strength dBm".red())
+            .style(Style::default().white())
+            .bounds([-100.0, 0.0])
+            .labels(["-100.0", "-50.0", "0.0"]);
+
+        let chart = Chart::new(datasets)
+            .block(Block::new().title("Chart"))
+            .x_axis(x_axis)
+            .y_axis(y_axis);
+
+        frame.render_widget(chart, chart_);
     }
 }

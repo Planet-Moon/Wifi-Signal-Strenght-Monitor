@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime};
@@ -5,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Style, Stylize};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState,
+    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame, symbols};
 use wifi_scan::Wifi;
@@ -15,11 +16,11 @@ use crate::event::Event;
 #[derive(Debug, Clone)]
 struct Datapoint {
     timestamp: Duration,
-    signal_strength: i32,
+    signal_strength: Option<i32>,
 }
 
 impl Datapoint {
-    fn new(time: Duration, value: i32) -> Self {
+    fn new(time: Duration, value: Option<i32>) -> Self {
         Self {
             timestamp: time,
             signal_strength: value,
@@ -29,28 +30,23 @@ impl Datapoint {
 
 impl From<Datapoint> for (f64, f64) {
     fn from(value: Datapoint) -> Self {
-        (value.timestamp.as_secs_f64(), value.signal_strength as f64)
+        (
+            value.timestamp.as_secs_f64(),
+            if let Some(value) = value.signal_strength {
+                value as f64
+            } else {
+                f64::NAN
+            },
+        )
     }
 }
 
 #[derive(Debug)]
 struct DataPointContainer {
-    start_time: SystemTime,
     data: Vec<Datapoint>,
 }
 
 impl DataPointContainer {
-    fn new() -> Self {
-        Self {
-            start_time: SystemTime::now(),
-            data: Vec::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.data.clear();
-    }
-
     fn get_limits_x(&self) -> Option<[f64; 2]> {
         match self.data.len() {
             0 | 1 => None,
@@ -74,14 +70,16 @@ impl DataPointContainer {
                         max = i.signal_strength;
                     }
                 }
-                Some([min as f64, max as f64])
+                match (max, min) {
+                    (Some(max), Some(min)) => Some([min as f64, max as f64]),
+                    _ => None,
+                }
             }
         }
     }
 
-    fn push(&mut self, value: i32) {
-        self.data
-            .push(Datapoint::new(self.start_time.elapsed().unwrap(), value));
+    fn push(&mut self, datapoint: Datapoint) {
+        self.data.push(datapoint);
     }
 }
 
@@ -93,7 +91,7 @@ impl<'a> DataPointContainer {
 
 #[derive(Debug)]
 pub struct WifiScanResult {
-    timestamp: std::time::SystemTime,
+    timestamp: Duration,
     wifi: Result<Vec<Wifi>, String>,
 }
 
@@ -102,9 +100,10 @@ pub struct App {
     exit: bool,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
+    time_reference: SystemTime,
     table_state: TableState,
     detected_wifis: WifiScanResult,
-    chart_data: DataPointContainer,
+    history: HashMap<String, DataPointContainer>,
 }
 
 impl App {
@@ -114,12 +113,13 @@ impl App {
             exit: false,
             event_rx: rx,
             event_tx: tx,
+            time_reference: SystemTime::now(),
             table_state: TableState::default(),
             detected_wifis: WifiScanResult {
-                timestamp: SystemTime::now(),
+                timestamp: Duration::ZERO,
                 wifi: Ok(Vec::new()),
             },
-            chart_data: DataPointContainer::new(),
+            history: HashMap::new(),
         }
     }
 
@@ -127,15 +127,16 @@ impl App {
         self.event_tx.clone()
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
+    fn start_threads(&self) {
         thread::spawn({
             let event_tx = self.event_tx.clone();
+            let time_reference = self.time_reference;
             move || {
                 loop {
                     let wifi_scan_result = wifi_scan::scan();
                     event_tx
                         .send(Event::WifiScanned(WifiScanResult {
-                            timestamp: SystemTime::now(),
+                            timestamp: time_reference.elapsed().unwrap(),
                             wifi: wifi_scan_result.map_err(|e| e.to_string()),
                         }))
                         .unwrap();
@@ -143,13 +144,22 @@ impl App {
                 }
             }
         });
+    }
+
+    fn run_once(&mut self) -> color_eyre::eyre::Result<()> {
+        if let Ok(event) = self.event_rx.recv()
+            && let Some(new) = self.handle_event(event)
+        {
+            new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
+        self.start_threads();
         while !self.exit {
             terminal.draw(|f| self.draw(f))?;
-            if let Ok(event) = self.event_rx.recv()
-                && let Some(new) = self.handle_event(event)
-            {
-                new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
-            }
+            self.run_once()?;
         }
         Ok(())
     }
@@ -161,12 +171,10 @@ impl App {
                 None
             }
             Event::SelectPrev => {
-                self.chart_data.clear();
                 self.table_state.select_previous();
                 None
             }
             Event::SelectNext => {
-                self.chart_data.clear();
                 self.table_state.select_next();
                 None
             }
@@ -176,11 +184,17 @@ impl App {
                     wifi.sort_by_key(|b| std::cmp::Reverse(b.signal_level));
                 }
 
-                if let Some(s) = self.table_state.selected()
-                    && let Ok(wifi) = &self.detected_wifis.wifi
-                    && let Some(e) = wifi.get(s)
-                {
-                    self.chart_data.push(e.signal_level);
+                if let Ok(wifi) = &self.detected_wifis.wifi {
+                    wifi.iter().for_each(|w| {
+                        let dp = Datapoint::new(
+                            self.time_reference.elapsed().unwrap(),
+                            Some(w.signal_level),
+                        );
+                        self.history
+                            .entry(w.ssid.clone())
+                            .and_modify(|value| value.push(dp.clone()))
+                            .or_insert(DataPointContainer { data: vec![dp] });
+                    });
                 }
 
                 None
@@ -207,21 +221,20 @@ impl App {
             }
         };
 
-        let ts = time_format::from_system_time(self.detected_wifis.timestamp).unwrap();
+        let ts = time_format::from_system_time(self.time_reference + self.detected_wifis.timestamp)
+            .unwrap();
         let formatted_time = time_format::format_iso8601_local(ts).unwrap();
         items.push(formatted_time.to_string());
 
-        let layout = Layout::default()
+        let [table_area, chart_area, current_charted_area, debug_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Percentage(50),
                 Constraint::Percentage(50),
                 Constraint::Min(1),
+                Constraint::Min(5),
             ])
-            .split(frame.area());
-        let table_area = layout[0];
-        let chart_area = layout[1];
-        let current_charted_area = layout[2];
+            .areas(frame.area());
 
         let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
             Ok(wifi) => wifi
@@ -280,22 +293,30 @@ impl App {
             None
         };
 
-        let m = self
-            .chart_data
-            .get_data()
-            .clone()
-            .into_iter()
-            .map(|d| d.into())
-            .collect::<Vec<(f64, f64)>>();
+        let history_element = match &selected_wifi_ssid {
+            Some(ssid) => self.history.get(ssid),
+            None => None,
+        };
+        let data = match history_element {
+            Some(element) => element
+                .get_data()
+                .clone()
+                .into_iter()
+                .map(|p| p.into())
+                .collect::<Vec<(f64, f64)>>(),
+            None => Vec::new(),
+        };
         let datasets = vec![
             Dataset::default()
                 .name("Wifi signal strengh")
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().magenta())
-                .data(&m),
+                .data(&data),
         ];
-        let x_bounds = self.chart_data.get_limits_x().unwrap_or([0.0, 10.0]);
+        let x_bounds = history_element
+            .and_then(|el| el.get_limits_x())
+            .unwrap_or([0.0, 10.0]);
         let x_labels = x_bounds
             .iter()
             .map(|i| i.to_string())
@@ -307,7 +328,9 @@ impl App {
             .labels(x_labels);
 
         // Create the Y axis and define its properties
-        let y_bounds = self.chart_data.get_limits_y().unwrap_or([0.0, 10.0]);
+        let y_bounds = history_element
+            .and_then(|el| el.get_limits_y())
+            .unwrap_or([0.0, 10.0]);
         let y_labels = y_bounds
             .iter()
             .map(|i| i.to_string())
@@ -330,13 +353,47 @@ impl App {
         frame.render_widget(
             Paragraph::new(format!(
                 "{}, {}",
-                selected_wifi_ssid.unwrap_or_default(),
-                m.len()
+                selected_wifi_ssid.clone().unwrap_or_default(),
+                data.len()
             ))
             .bold()
             .cyan()
             .centered(),
             current_charted_area,
         );
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{:?}",
+                self.history
+                    .get(&selected_wifi_ssid.unwrap_or_default())
+                    .map(|d| d
+                        .data
+                        .iter()
+                        .map(|i| i.signal_strength.unwrap())
+                        .collect::<Vec<i32>>())
+            ))
+            .yellow()
+            .italic()
+            .wrap(Wrap { trim: true }),
+            debug_area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_test {
+    use super::*;
+
+    #[test]
+    fn run_test() {
+        let mut app = App::new();
+        let _event_tx = app.event_sender();
+        app.start_threads();
+        loop {
+            println!("{:?}", app.history);
+            let _ = app.run_once();
+            sleep(Duration::from_secs_f32(0.1));
+        }
     }
 }

@@ -4,7 +4,9 @@ use std::time::{Duration, SystemTime};
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Style, Stylize};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Row, Table, TableState};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState,
+};
 use ratatui::{DefaultTerminal, Frame, symbols};
 use wifi_scan::Wifi;
 
@@ -43,6 +45,10 @@ impl DataPointContainer {
             start_time: SystemTime::now(),
             data: Vec::new(),
         }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
     }
 
     fn get_limits_x(&self) -> Option<[f64; 2]> {
@@ -108,7 +114,7 @@ impl App {
             exit: false,
             event_rx: rx,
             event_tx: tx,
-            table_state: TableState::default().with_selected(Some(0)),
+            table_state: TableState::default(),
             detected_wifis: WifiScanResult {
                 timestamp: SystemTime::now(),
                 wifi: Ok(Vec::new()),
@@ -155,22 +161,28 @@ impl App {
                 None
             }
             Event::SelectPrev => {
+                self.chart_data.clear();
                 self.table_state.select_previous();
                 None
             }
             Event::SelectNext => {
+                self.chart_data.clear();
                 self.table_state.select_next();
                 None
             }
             Event::WifiScanned(v) => {
                 self.detected_wifis = v;
-                if let Ok(w) = &self.detected_wifis.wifi {
-                    if let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch")) {
-                        self.chart_data.push(a.signal_level);
-                    } else if let Some(a) = w.iter().find(|e| e.ssid.eq("Pizza Planet")) {
-                        self.chart_data.push(a.signal_level);
-                    }
+                if let Ok(wifi) = &mut self.detected_wifis.wifi {
+                    wifi.sort_by_key(|b| std::cmp::Reverse(b.signal_level));
                 }
+
+                if let Some(s) = self.table_state.selected()
+                    && let Ok(wifi) = &self.detected_wifis.wifi
+                    && let Some(e) = wifi.get(s)
+                {
+                    self.chart_data.push(e.signal_level);
+                }
+
                 None
             }
             Event::SelectColPrev => {
@@ -204,28 +216,25 @@ impl App {
             .constraints([
                 Constraint::Percentage(50),
                 Constraint::Percentage(50),
-                // Constraint::Min(1),
+                Constraint::Min(1),
             ])
             .split(frame.area());
         let table_ = layout[0];
         let chart_ = layout[1];
-        // let debug_ = layout[2];
+        let current_charted_ = layout[2];
 
         let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
-            Ok(wifi) => {
-                let mut w = wifi.clone();
-                w.sort_by_key(|b| std::cmp::Reverse(b.signal_level));
-                w.into_iter()
-                    .map(|e| {
-                        Row::new(vec![
-                            e.ssid.to_string(),
-                            e.mac.to_string(),
-                            e.channel.to_string(),
-                            e.signal_level.to_string(),
-                        ])
-                    })
-                    .collect::<Vec<Row>>()
-            }
+            Ok(wifi) => wifi
+                .iter()
+                .map(|e| {
+                    Row::new(vec![
+                        e.ssid.to_string(),
+                        e.mac.to_string(),
+                        e.channel.to_string(),
+                        e.signal_level.to_string(),
+                    ])
+                })
+                .collect::<Vec<Row>>(),
             Err(_) => Vec::new(),
         };
         let widths = [
@@ -239,7 +248,7 @@ impl App {
             Ok(_) => format!("Updated on {}", formatted_time),
             Err(e) => format!("Updated on {} | {}", formatted_time, e),
         };
-        let table = Table::new(table_rows, widths)
+        let table = Table::new(table_rows.clone(), widths)
             .column_spacing(1)
             .style(Style::new().blue())
             .header(
@@ -257,19 +266,27 @@ impl App {
             .column_highlight_style(Style::new().red())
             .cell_highlight_style(Style::new().blue())
             .highlight_symbol(">>");
+        if self.table_state.selected().is_none() {
+            self.table_state.select(Some(0));
+        }
         frame.render_stateful_widget(table, table_, &mut self.table_state);
 
-        let data = self.chart_data.get_data().clone();
-        let m = data
+        let selected_wifi_ssid = if let Some(s) = self.table_state.selected()
+            && let Ok(wifi) = &self.detected_wifis.wifi
+            && let Some(e) = wifi.get(s)
+        {
+            Some(e.ssid.clone())
+        } else {
+            None
+        };
+
+        let m = self
+            .chart_data
+            .get_data()
+            .clone()
             .into_iter()
             .map(|d| d.into())
             .collect::<Vec<(f64, f64)>>();
-        // frame.render_widget(
-        //     Paragraph::new(format!("{:?}", m))
-        //         .alignment(HorizontalAlignment::Right)
-        //         .cyan(),
-        //     debug_,
-        // );
         let datasets = vec![
             Dataset::default()
                 .name("Wifi signal strengh")
@@ -309,5 +326,17 @@ impl App {
             .y_axis(y_axis);
 
         frame.render_widget(chart, chart_);
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{}, {}",
+                selected_wifi_ssid.unwrap_or_default(),
+                m.len()
+            ))
+            .bold()
+            .cyan()
+            .centered(),
+            current_charted_,
+        );
     }
 }

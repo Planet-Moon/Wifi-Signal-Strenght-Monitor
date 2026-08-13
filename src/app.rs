@@ -12,14 +12,14 @@ use crate::event::Event;
 
 #[derive(Debug, Clone)]
 struct Datapoint {
-    timestamp: std::time::SystemTime,
+    timestamp: Duration,
     signal_strength: i32,
 }
 
 impl Datapoint {
-    fn new(value: i32) -> Self {
+    fn new(time: Duration, value: i32) -> Self {
         Self {
-            timestamp: std::time::SystemTime::now(),
+            timestamp: time,
             signal_strength: value,
         }
     }
@@ -27,49 +27,55 @@ impl Datapoint {
 
 impl From<Datapoint> for (f64, f64) {
     fn from(value: Datapoint) -> Self {
-        (
-            value.timestamp.elapsed().unwrap().as_secs_f64(),
-            value.signal_strength as f64,
-        )
+        (value.timestamp.as_secs_f64(), value.signal_strength as f64)
     }
 }
 
 #[derive(Debug)]
 struct DataPointContainer {
+    start_time: SystemTime,
     data: Vec<Datapoint>,
 }
 
 impl DataPointContainer {
     fn new() -> Self {
-        Self { data: Vec::new() }
+        Self {
+            start_time: SystemTime::now(),
+            data: Vec::new(),
+        }
     }
 
     fn get_limits_x(&self) -> Option<[f64; 2]> {
         match self.data.len() {
             0 | 1 => None,
             _ => Some([
-                self.data
-                    .last()
-                    .unwrap()
-                    .timestamp
-                    .elapsed()
-                    .unwrap()
-                    .as_secs_f64()
-                    - 1.0,
-                self.data
-                    .first()
-                    .unwrap()
-                    .timestamp
-                    .elapsed()
-                    .unwrap()
-                    .as_secs_f64()
-                    + 1.0,
+                self.data.first().unwrap().timestamp.as_secs_f64(),
+                self.data.last().unwrap().timestamp.as_secs_f64(),
             ]),
         }
     }
 
+    fn get_limits_y(&self) -> Option<[f64; 2]> {
+        match self.data.len() {
+            0 | 1 => None,
+            _ => {
+                let mut min = self.data.first().unwrap().signal_strength;
+                let mut max = min;
+                for i in &self.data {
+                    if i.signal_strength < min {
+                        min = i.signal_strength;
+                    } else if i.signal_strength > max {
+                        max = i.signal_strength;
+                    }
+                }
+                Some([min as f64, max as f64])
+            }
+        }
+    }
+
     fn push(&mut self, value: i32) {
-        self.data.push(Datapoint::new(value));
+        self.data
+            .push(Datapoint::new(self.start_time.elapsed().unwrap(), value));
     }
 }
 
@@ -158,10 +164,12 @@ impl App {
             }
             Event::WifiScanned(v) => {
                 self.detected_wifis = v;
-                if let Ok(w) = &self.detected_wifis.wifi
-                    && let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch"))
-                {
-                    self.chart_data.push(a.signal_level);
+                if let Ok(w) = &self.detected_wifis.wifi {
+                    if let Some(a) = w.iter().find(|e| e.ssid.eq("Grinch")) {
+                        self.chart_data.push(a.signal_level);
+                    } else if let Some(a) = w.iter().find(|e| e.ssid.eq("Pizza Planet")) {
+                        self.chart_data.push(a.signal_level);
+                    }
                 }
                 None
             }
@@ -193,10 +201,15 @@ impl App {
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+                // Constraint::Min(1),
+            ])
             .split(frame.area());
         let table_ = layout[0];
         let chart_ = layout[1];
+        // let debug_ = layout[2];
 
         let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
             Ok(wifi) => {
@@ -249,13 +262,18 @@ impl App {
         let data = self.chart_data.get_data().clone();
         let m = data
             .into_iter()
-            .rev()
             .map(|d| d.into())
             .collect::<Vec<(f64, f64)>>();
+        // frame.render_widget(
+        //     Paragraph::new(format!("{:?}", m))
+        //         .alignment(HorizontalAlignment::Right)
+        //         .cyan(),
+        //     debug_,
+        // );
         let datasets = vec![
             Dataset::default()
                 .name("Wifi signal strengh")
-                .marker(symbols::Marker::Dot)
+                .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().magenta())
                 .data(&m),
@@ -272,11 +290,18 @@ impl App {
             .labels(x_labels);
 
         // Create the Y axis and define its properties
+        let y_bounds = self.chart_data.get_limits_y().unwrap_or([0.0, 10.0]);
+        let y_labels = y_bounds
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<String>>();
         let y_axis = Axis::default()
             .title("Signal strength dBm".red())
             .style(Style::default().white())
-            .bounds([-100.0, 0.0])
-            .labels(["-100.0", "-50.0", "0.0"]);
+            // .bounds([-100.0, 0.0])
+            // .labels(["-100.0", "-50.0", "0.0"]);
+            .bounds(y_bounds)
+            .labels(y_labels);
 
         let chart = Chart::new(datasets)
             .block(Block::new().title("Chart"))

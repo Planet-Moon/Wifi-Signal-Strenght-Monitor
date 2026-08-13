@@ -219,9 +219,9 @@ impl App {
                 Constraint::Min(1),
             ])
             .split(frame.area());
-        let table_ = layout[0];
-        let chart_ = layout[1];
-        let current_charted_ = layout[2];
+        let table_area = layout[0];
+        let chart_area = layout[1];
+        let current_charted_area = layout[2];
 
         let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
             Ok(wifi) => wifi
@@ -269,7 +269,7 @@ impl App {
         if self.table_state.selected().is_none() {
             self.table_state.select(Some(0));
         }
-        frame.render_stateful_widget(table, table_, &mut self.table_state);
+        frame.render_stateful_widget(table, table_area, &mut self.table_state);
 
         let selected_wifi_ssid = if let Some(s) = self.table_state.selected()
             && let Ok(wifi) = &self.detected_wifis.wifi
@@ -325,7 +325,7 @@ impl App {
             .x_axis(x_axis)
             .y_axis(y_axis);
 
-        frame.render_widget(chart, chart_);
+        frame.render_widget(chart, chart_area);
 
         frame.render_widget(
             Paragraph::new(format!(
@@ -336,7 +336,7 @@ impl App {
             .bold()
             .cyan()
             .centered(),
-            current_charted_,
+            current_charted_area,
         );
     }
 }

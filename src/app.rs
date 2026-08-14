@@ -113,6 +113,82 @@ impl From<&Wifi> for WifiInfo {
 }
 
 #[derive(Debug)]
+struct Range {
+    min: f64,
+    max: f64,
+}
+
+impl Default for Range {
+    fn default() -> Self {
+        Self {
+            min: 0.0,
+            max: 10.0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Bounds {
+    x: Range,
+    y: Range,
+}
+
+type HistoryType = HashMap<WifiInfo, DataPointContainer>;
+
+fn find_bounds(history: &HistoryType) -> Option<Bounds> {
+    let mut history_values = history.values();
+    let first = history_values.next();
+    let [mut x_min, mut x_max] = first?.get_limits_x()?;
+    let [mut y_min, mut y_max] = first?.get_limits_y()?;
+
+    for val in history_values {
+        let x_lim = val.get_limits_x()?;
+        let y_lim = val.get_limits_y()?;
+
+        let check_min_max = |v: f64, min: &mut f64, max: &mut f64| {
+            if v < *min {
+                *min = v;
+            } else if v > *max {
+                *max = v;
+            }
+        };
+        let check_limits = |v: &[f64; 2], min: &mut f64, max: &mut f64| {
+            check_min_max(v[0], min, max);
+            check_min_max(v[1], min, max);
+        };
+        check_limits(&x_lim, &mut x_min, &mut x_max);
+        check_limits(&y_lim, &mut y_min, &mut y_max);
+    }
+
+    Some(Bounds {
+        x: Range {
+            min: x_min,
+            max: x_max,
+        },
+        y: Range {
+            min: y_min,
+            max: y_max,
+        },
+    })
+}
+
+#[derive(Debug, Default)]
+enum ScaleMode {
+    #[default]
+    Highlight,
+    Compare,
+}
+
+impl std::fmt::Display for ScaleMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScaleMode::Compare => write!(f, "Compare"),
+            ScaleMode::Highlight => write!(f, "Highlight"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct App {
     exit: bool,
     event_rx: mpsc::Receiver<Event>,
@@ -120,7 +196,9 @@ pub struct App {
     time_reference: SystemTime,
     table_state: TableState,
     detected_wifis: WifiScanResult,
-    history: HashMap<WifiInfo, DataPointContainer>,
+    history: HistoryType,
+    debug_text: String,
+    scale_mode: ScaleMode,
 }
 
 impl App {
@@ -137,6 +215,8 @@ impl App {
                 wifi: Ok(Vec::new()),
             },
             history: HashMap::new(),
+            debug_text: String::new(),
+            scale_mode: Default::default(),
         }
     }
 
@@ -223,7 +303,24 @@ impl App {
                             });
                         }
                     });
-                    assert!(self.history.values().all(|v| v.data.len() == max_n));
+
+                    let matched_length = self.history.values().all(|v| v.data.len() == max_n);
+                    self.debug_text = if matched_length == false {
+                        format!(
+                            "Max_len: {max_n} | {}",
+                            self.history
+                                .iter()
+                                .map(|(k, v)| {
+                                    format!("{} ({}): {}", k.ssid, k.mac, v.data.len() == max_n)
+                                })
+                                .collect::<Vec<String>>()
+                                .join(", ")
+                        )
+                    } else {
+                        String::new()
+                    };
+
+                    // assert!(self.history.values().all(|v| v.data.len() == max_n));
                 }
                 None
             }
@@ -233,6 +330,13 @@ impl App {
             }
             Event::SelectColNext => {
                 self.table_state.select_next_column();
+                None
+            }
+            Event::CycleScaleMode => {
+                self.scale_mode = match self.scale_mode {
+                    ScaleMode::Compare => ScaleMode::Highlight,
+                    ScaleMode::Highlight => ScaleMode::Compare,
+                };
                 None
             }
         }
@@ -254,12 +358,19 @@ impl App {
         let formatted_time = time_format::format_iso8601_local(ts).unwrap();
         items.push(formatted_time.to_string());
 
-        let [table_area, chart_area, current_charted_area, debug_area] = Layout::default()
+        let [
+            table_area,
+            chart_area,
+            current_charted_area,
+            debug_area,
+            app_debug_area,
+        ] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Percentage(50),
                 Constraint::Percentage(50),
                 Constraint::Min(1),
+                Constraint::Min(5),
                 Constraint::Min(5),
             ])
             .areas(frame.area());
@@ -341,13 +452,31 @@ impl App {
                 .style(Style::default().magenta())
                 .data(&data),
         ];
-        let x_bounds = history_element
-            .and_then(|el| el.get_limits_x())
-            .unwrap_or([0.0, 10.0]);
+
+        let (x_bounds, y_bounds) = match self.scale_mode {
+            ScaleMode::Compare => {
+                let db = find_bounds(&self.history).unwrap_or_default();
+                ([db.x.min, db.x.max], [db.y.min, db.y.max])
+            }
+            ScaleMode::Highlight => (
+                history_element
+                    .and_then(|el| el.get_limits_x())
+                    .unwrap_or([0.0, 10.0]),
+                history_element
+                    .and_then(|el| el.get_limits_y())
+                    .unwrap_or([0.0, 10.0]),
+            ),
+        };
+
         let x_labels = x_bounds
             .iter()
             .map(|i| i.to_string())
             .collect::<Vec<String>>();
+        let y_labels = y_bounds
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<String>>();
+
         let x_axis = Axis::default()
             .title("Time".red())
             .style(Style::default().white())
@@ -355,13 +484,6 @@ impl App {
             .labels(x_labels);
 
         // Create the Y axis and define its properties
-        let y_bounds = history_element
-            .and_then(|el| el.get_limits_y())
-            .unwrap_or([0.0, 10.0]);
-        let y_labels = y_bounds
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<String>>();
         let y_axis = Axis::default()
             .title("Signal strength dBm".red())
             .style(Style::default().white())
@@ -369,7 +491,6 @@ impl App {
             // .labels(["-100.0", "-50.0", "0.0"]);
             .bounds(y_bounds)
             .labels(y_labels);
-
         let chart = Chart::new(datasets)
             .block(Block::new().title("Chart"))
             .x_axis(x_axis)
@@ -379,8 +500,9 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(format!(
-                "{}, {}",
+                "{}, {}, {}",
                 selected_wifi.map(|f| f.ssid.clone()).unwrap_or_default(),
+                self.scale_mode,
                 data.len()
             ))
             .bold()
@@ -397,12 +519,21 @@ impl App {
                     .collect::<Vec<String>>()
             })
         });
+        let debug_values = (x_bounds, y_bounds);
         frame.render_widget(
             Paragraph::new(format!("{:?}", debug_values))
                 .yellow()
                 .italic()
                 .wrap(Wrap { trim: true }),
             debug_area,
+        );
+
+        frame.render_widget(
+            Paragraph::new(format!("{:?}", self.debug_text))
+                .red()
+                .italic()
+                .wrap(Wrap { trim: true }),
+            app_debug_area,
         );
     }
 }

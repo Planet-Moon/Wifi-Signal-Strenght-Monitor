@@ -13,6 +13,7 @@ pub enum Event {
     SelectColPrev,
     SelectColNext,
     WifiScanned(WifiScanResult),
+    CycleScaleMode,
 }
 
 fn handle_key_event(
@@ -25,6 +26,7 @@ fn handle_key_event(
         KeyCode::Right => tx.send(Event::SelectColNext)?,
         KeyCode::Up => tx.send(Event::SelectPrev)?,
         KeyCode::Down => tx.send(Event::SelectNext)?,
+        KeyCode::Char('s') | KeyCode::Char('S') => tx.send(Event::CycleScaleMode)?,
         _ => {}
     }
     Ok(())

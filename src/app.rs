@@ -95,6 +95,23 @@ pub struct WifiScanResult {
     wifi: Result<Vec<Wifi>, String>,
 }
 
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct WifiInfo {
+    ssid: String,
+    mac: String,
+    channel: u32,
+}
+
+impl From<&Wifi> for WifiInfo {
+    fn from(value: &Wifi) -> Self {
+        Self {
+            ssid: value.ssid.clone(),
+            mac: value.mac.clone(),
+            channel: value.channel,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     exit: bool,
@@ -103,7 +120,7 @@ pub struct App {
     time_reference: SystemTime,
     table_state: TableState,
     detected_wifis: WifiScanResult,
-    history: HashMap<String, DataPointContainer>,
+    history: HashMap<WifiInfo, DataPointContainer>,
 }
 
 impl App {
@@ -191,12 +208,23 @@ impl App {
                             Some(w.signal_level),
                         );
                         self.history
-                            .entry(w.ssid.clone())
+                            .entry(w.into())
                             .and_modify(|value| value.push(dp.clone()))
                             .or_insert(DataPointContainer { data: vec![dp] });
                     });
                 }
-
+                let longest_history_n = self.history.values().map(|v| v.data.len()).max();
+                if let Some(max_n) = longest_history_n {
+                    self.history.values_mut().for_each(|v| {
+                        if v.data.len() < max_n {
+                            v.data.push(Datapoint {
+                                timestamp: self.time_reference.elapsed().unwrap(),
+                                signal_strength: None,
+                            });
+                        }
+                    });
+                    assert!(self.history.values().all(|v| v.data.len() == max_n));
+                }
                 None
             }
             Event::SelectColPrev => {
@@ -284,17 +312,16 @@ impl App {
         }
         frame.render_stateful_widget(table, table_area, &mut self.table_state);
 
-        let selected_wifi_ssid = if let Some(s) = self.table_state.selected()
+        let selected_wifi = if let Some(s) = self.table_state.selected()
             && let Ok(wifi) = &self.detected_wifis.wifi
-            && let Some(e) = wifi.get(s)
         {
-            Some(e.ssid.clone())
+            wifi.get(s)
         } else {
             None
         };
 
-        let history_element = match &selected_wifi_ssid {
-            Some(ssid) => self.history.get(ssid),
+        let history_element = match &selected_wifi {
+            Some(wifi) => self.history.get(&(*wifi).into()),
             None => None,
         };
         let data = match history_element {
@@ -353,7 +380,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(format!(
                 "{}, {}",
-                selected_wifi_ssid.clone().unwrap_or_default(),
+                selected_wifi.map(|f| f.ssid.clone()).unwrap_or_default(),
                 data.len()
             ))
             .bold()
@@ -362,20 +389,19 @@ impl App {
             current_charted_area,
         );
 
+        let debug_values = selected_wifi.and_then(|wifi| {
+            self.history.get(&wifi.into()).map(|d| {
+                d.data
+                    .iter()
+                    .map(|i| i.signal_strength.map(|v| v.to_string()).unwrap_or_default())
+                    .collect::<Vec<String>>()
+            })
+        });
         frame.render_widget(
-            Paragraph::new(format!(
-                "{:?}",
-                self.history
-                    .get(&selected_wifi_ssid.unwrap_or_default())
-                    .map(|d| d
-                        .data
-                        .iter()
-                        .map(|i| i.signal_strength.unwrap())
-                        .collect::<Vec<i32>>())
-            ))
-            .yellow()
-            .italic()
-            .wrap(Wrap { trim: true }),
+            Paragraph::new(format!("{:?}", debug_values))
+                .yellow()
+                .italic()
+                .wrap(Wrap { trim: true }),
             debug_area,
         );
     }

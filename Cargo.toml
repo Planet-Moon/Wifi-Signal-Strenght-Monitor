@@ -11,3 +11,20 @@ ratatui = "0.30.2"
 tokio = { version = "1.53.1", features = ["full"] }
 wifi_scan = "0.7.3"
 time-format = "1.2.2"
+
+[features]
+default = ["linux", "windows", "macos"]
+linux = ["tokio"]
+windows = ["windows-sys"]
+macos = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1.0", features = ["process"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Using windows-sys for lightweight raw OS API bindings
+windows-sys = { version = "0.52", features = ["Win32_NetworkManagement_WiFi", "Win32_Foundation"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS native Objective-C runtime interaction
+objc = "0.2"

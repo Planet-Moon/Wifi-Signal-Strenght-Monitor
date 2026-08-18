@@ -14,6 +14,8 @@ pub enum Event {
     SelectColNext,
     WifiScanned(WifiScanResult),
     CycleScaleMode,
+    TogglePopup,
+    FastScanMeasurement(i32),
 }
 
 fn handle_key_event(
@@ -27,6 +29,7 @@ fn handle_key_event(
         KeyCode::Up => tx.send(Event::SelectPrev)?,
         KeyCode::Down => tx.send(Event::SelectNext)?,
         KeyCode::Char('s') | KeyCode::Char('S') => tx.send(Event::CycleScaleMode)?,
+        KeyCode::Char('p') | KeyCode::Char('P') => tx.send(Event::TogglePopup)?,
         _ => {}
     }
     Ok(())

@@ -1,17 +1,19 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, sleep};
 use std::time::{Duration, SystemTime};
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Style, Stylize};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame, symbols};
 use wifi_scan::Wifi;
 
 use crate::event::Event;
+use crate::wifi::scan_single_ssid_fast;
 
 #[derive(Debug, Clone)]
 struct Datapoint {
@@ -199,6 +201,10 @@ pub struct App {
     history: HistoryType,
     debug_text: String,
     scale_mode: ScaleMode,
+    show_popup: Arc<AtomicBool>,
+    fast_buffer: Vec<(Duration, i32)>,
+    fast_scan_target_ssid: Option<String>,
+    fast_aquisition_thread: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
@@ -217,6 +223,10 @@ impl App {
             history: HashMap::new(),
             debug_text: String::new(),
             scale_mode: Default::default(),
+            show_popup: Arc::new(AtomicBool::new(false)),
+            fast_buffer: Vec::new(),
+            fast_scan_target_ssid: None,
+            fast_aquisition_thread: None,
         }
     }
 
@@ -243,25 +253,25 @@ impl App {
         });
     }
 
-    fn run_once(&mut self) -> color_eyre::eyre::Result<()> {
+    async fn run_once(&mut self) -> color_eyre::eyre::Result<()> {
         if let Ok(event) = self.event_rx.recv()
-            && let Some(new) = self.handle_event(event)
+            && let Some(new) = self.handle_event(event).await
         {
             new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
         }
         Ok(())
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
+    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
         self.start_threads();
         while !self.exit {
             terminal.draw(|f| self.draw(f))?;
-            self.run_once()?;
+            self.run_once().await?;
         }
         Ok(())
     }
 
-    fn handle_event(&mut self, event: Event) -> Option<Vec<Event>> {
+    async fn handle_event(&mut self, event: Event) -> Option<Vec<Event>> {
         match event {
             Event::Quit => {
                 self.exit = true;
@@ -337,6 +347,60 @@ impl App {
                     ScaleMode::Compare => ScaleMode::Highlight,
                     ScaleMode::Highlight => ScaleMode::Compare,
                 };
+                None
+            }
+            Event::TogglePopup => {
+                if self.table_state.selected().is_none() {
+                    return None;
+                }
+                self.show_popup
+                    .store(!self.show_popup.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.fast_scan_target_ssid = Some(
+                    self.detected_wifis
+                        .wifi
+                        .as_ref()
+                        .unwrap()
+                        .get(self.table_state.selected().unwrap())
+                        .unwrap()
+                        .ssid
+                        .clone(),
+                );
+                match self.show_popup.load(Ordering::Relaxed) {
+                    true => {
+                        self.fast_aquisition_thread = Some(tokio::spawn({
+                            let run_condition = self.show_popup.clone();
+                            let event_tx = self.event_sender();
+                            let ssid = self.fast_scan_target_ssid.clone().unwrap();
+                            async move {
+                                while run_condition.load(Ordering::Relaxed) {
+                                    if let Some(sample) = scan_single_ssid_fast(ssid.as_str()).await
+                                    {
+                                        event_tx
+                                            .send(Event::FastScanMeasurement(
+                                                sample.signal_strength,
+                                            ))
+                                            .unwrap();
+                                    }
+                                    sleep(Duration::from_millis(100));
+                                }
+                            }
+                        }));
+                    }
+                    false => {
+                        if let Some(thread) = &mut self.fast_aquisition_thread {
+                            let _ = thread.await.unwrap();
+                            self.fast_aquisition_thread = None;
+                        }
+                        self.fast_scan_target_ssid = None;
+                        self.fast_buffer.clear();
+                    }
+                }
+
+                None
+            }
+            Event::FastScanMeasurement(value) => {
+                self.fast_buffer
+                    .push((self.time_reference.elapsed().unwrap(), value));
                 None
             }
         }
@@ -535,6 +599,69 @@ impl App {
                 .wrap(Wrap { trim: true }),
             app_debug_area,
         );
+
+        if self.show_popup.load(Ordering::Relaxed) {
+            let popup_block = Block::bordered().title("Popup");
+            let centered_area = frame
+                .area()
+                .centered(Constraint::Percentage(60), Constraint::Percentage(20));
+            // clears out any background in the area before rendering the popup
+            frame.render_widget(Clear, centered_area);
+            // let paragraph = Paragraph::new("Lorem ipsum").block(popup_block);
+            // frame.render_widget(paragraph, centered_area);
+
+            let data = self
+                .fast_buffer
+                .iter()
+                .map(|(duration, value)| (duration.as_secs_f64(), *value as f64))
+                .collect::<Vec<(f64, f64)>>();
+
+            let datasets = vec![
+                Dataset::default()
+                    .name("Wifi signal strengh")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().yellow())
+                    .data(&data),
+            ];
+
+            let x_bounds = [0.0, 10.0];
+            let y_bounds = [0.0, 10.0];
+
+            let x_labels = x_bounds
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<String>>();
+
+            let y_labels = y_bounds
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<String>>();
+
+            let x_axis = Axis::default()
+                .title("Time".red())
+                .style(Style::default().white())
+                .bounds(x_bounds)
+                .labels(x_labels);
+
+            // Create the Y axis and define its properties
+            let y_axis = Axis::default()
+                .title("Signal strength dBm".red())
+                .style(Style::default().white())
+                // .bounds([-100.0, 0.0])
+                // .labels(["-100.0", "-50.0", "0.0"]);
+                .bounds(y_bounds)
+                .labels(y_labels);
+
+            let fast_chart = Chart::new(datasets)
+                .block(Block::new().title("Fast Chart"))
+                .x_axis(x_axis)
+                .y_axis(y_axis);
+
+            // another solution is to use the inner area of the block
+            let inner_area = popup_block.inner(centered_area);
+            frame.render_widget(fast_chart, inner_area);
+        }
     }
 }
 

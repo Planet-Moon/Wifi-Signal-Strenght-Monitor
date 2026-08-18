@@ -1,5 +1,6 @@
 mod app;
 mod event;
+mod wifi;
 
 use std::thread;
 
@@ -20,7 +21,7 @@ pub async fn main() -> color_eyre::eyre::Result<()> {
         }
     });
 
-    let app_result = app.run(&mut terminal);
+    let app_result = app.run(&mut terminal).await;
 
     ratatui::restore();
     app_result

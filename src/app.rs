@@ -1,193 +1,155 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::collections::VecDeque;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, sleep};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
-use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
-};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
 use ratatui::{DefaultTerminal, Frame, symbols};
-use wifi_scan::Wifi;
 
 use crate::event::Event;
-use crate::wifi::scan_single_ssid_fast;
+use crate::wifi::{ConnectedAp, WlanSession};
 
-#[derive(Debug, Clone)]
-struct Datapoint {
-    timestamp: Duration,
-    signal_strength: Option<i32>,
+/// The driver refreshes RSSI about once per beacon interval (~100 ms), so this oversamples a little
+/// and the trace shows short plateaus. That is expected.
+const FAST_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+/// How often the sampler re-checks that the adapter is still associated with the target AP.
+const STATUS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// Redraw pulse. Without it the UI would freeze whenever no samples arrive.
+const TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// Selectable widths of the rolling time window, in seconds.
+const WIN_PRESETS: [u64; 4] = [10, 30, 60, 120];
+const DEFAULT_WINDOW: usize = 1;
+/// Never let the y axis collapse below this many dBm, or a steady signal looks like noise.
+const MIN_Y_SPAN: f64 = 10.0;
+/// Platforms where [`WlanSession`] can read a live RSSI at all.
+const FAST_PATH_SUPPORTED: bool = cfg!(any(target_os = "windows", target_os = "linux"));
+
+/// A rolling time window of RSSI samples.
+#[derive(Debug)]
+struct SampleWindow {
+    window: Duration,
+    data: VecDeque<(Duration, i32)>,
 }
 
-impl Datapoint {
-    fn new(time: Duration, value: Option<i32>) -> Self {
+impl SampleWindow {
+    fn new(window: Duration) -> Self {
         Self {
-            timestamp: time,
-            signal_strength: value,
+            window,
+            data: VecDeque::new(),
         }
     }
-}
 
-impl From<Datapoint> for (f64, f64) {
-    fn from(value: Datapoint) -> Self {
-        (
-            value.timestamp.as_secs_f64(),
-            if let Some(value) = value.signal_strength {
-                value as f64
+    fn push(&mut self, at: Duration, dbm: i32) {
+        self.data.push_back((at, dbm));
+        self.trim();
+    }
+
+    /// Drop everything older than `window` behind the newest sample.
+    fn trim(&mut self) {
+        let Some(&(newest, _)) = self.data.back() else {
+            return;
+        };
+        while let Some(&(oldest, _)) = self.data.front() {
+            if newest.saturating_sub(oldest) > self.window {
+                self.data.pop_front();
             } else {
-                f64::NAN
-            },
-        )
-    }
-}
-
-#[derive(Debug)]
-struct DataPointContainer {
-    data: Vec<Datapoint>,
-}
-
-impl DataPointContainer {
-    fn get_limits_x(&self) -> Option<[f64; 2]> {
-        match self.data.len() {
-            0 | 1 => None,
-            _ => Some([
-                self.data.first().unwrap().timestamp.as_secs_f64(),
-                self.data.last().unwrap().timestamp.as_secs_f64(),
-            ]),
-        }
-    }
-
-    fn get_limits_y(&self) -> Option<[f64; 2]> {
-        match self.data.len() {
-            0 | 1 => None,
-            _ => {
-                let mut min = self.data.first().unwrap().signal_strength;
-                let mut max = min;
-                for i in &self.data {
-                    if i.signal_strength < min {
-                        min = i.signal_strength;
-                    } else if i.signal_strength > max {
-                        max = i.signal_strength;
-                    }
-                }
-                match (max, min) {
-                    (Some(max), Some(min)) => Some([min as f64, max as f64]),
-                    _ => None,
-                }
+                break;
             }
         }
     }
 
-    fn push(&mut self, datapoint: Datapoint) {
-        self.data.push(datapoint);
+    fn set_window(&mut self, window: Duration) {
+        self.window = window;
+        self.trim();
     }
-}
 
-impl<'a> DataPointContainer {
-    fn get_data(&'a self) -> &'a Vec<Datapoint> {
-        &self.data
+    fn clear(&mut self) {
+        self.data.clear();
     }
-}
 
-#[derive(Debug)]
-pub struct WifiScanResult {
-    timestamp: Duration,
-    wifi: Result<Vec<Wifi>, String>,
-}
-
-#[derive(Debug, Eq, PartialEq, Hash)]
-struct WifiInfo {
-    ssid: String,
-    mac: String,
-    channel: u32,
-}
-
-impl From<&Wifi> for WifiInfo {
-    fn from(value: &Wifi) -> Self {
-        Self {
-            ssid: value.ssid.clone(),
-            mac: value.mac.clone(),
-            channel: value.channel,
-        }
+    fn len(&self) -> usize {
+        self.data.len()
     }
-}
 
-#[derive(Debug)]
-struct Range {
-    min: f64,
-    max: f64,
-}
-
-impl Default for Range {
-    fn default() -> Self {
-        Self {
-            min: 0.0,
-            max: 10.0,
-        }
+    /// A window that ends at the newest sample, so the axis scrolls at constant width instead of
+    /// stretching as data accumulates.
+    fn bounds_x(&self) -> [f64; 2] {
+        let newest = self.data.back().map(|&(t, _)| t).unwrap_or_default();
+        let width = self.window.as_secs_f64();
+        let end = newest.as_secs_f64();
+        [end - width, end]
     }
-}
 
-#[derive(Debug, Default)]
-struct Bounds {
-    x: Range,
-    y: Range,
-}
-
-type HistoryType = HashMap<WifiInfo, DataPointContainer>;
-
-fn find_bounds(history: &HistoryType) -> Option<Bounds> {
-    let mut history_values = history.values();
-    let first = history_values.next();
-    let [mut x_min, mut x_max] = first?.get_limits_x()?;
-    let [mut y_min, mut y_max] = first?.get_limits_y()?;
-
-    for val in history_values {
-        let x_lim = val.get_limits_x()?;
-        let y_lim = val.get_limits_y()?;
-
-        let check_min_max = |v: f64, min: &mut f64, max: &mut f64| {
-            if v < *min {
-                *min = v;
-            } else if v > *max {
-                *max = v;
-            }
+    /// True min/max, padded, with a floor on the span, clamped to a plausible dBm range.
+    fn bounds_y(&self) -> [f64; 2] {
+        let Some(&(_, first)) = self.data.front() else {
+            return [-100.0, 0.0];
         };
-        let check_limits = |v: &[f64; 2], min: &mut f64, max: &mut f64| {
-            check_min_max(v[0], min, max);
-            check_min_max(v[1], min, max);
-        };
-        check_limits(&x_lim, &mut x_min, &mut x_max);
-        check_limits(&y_lim, &mut y_min, &mut y_max);
+        let (mut min, mut max) = (first as f64, first as f64);
+        for &(_, v) in &self.data {
+            let v = v as f64;
+            min = min.min(v);
+            max = max.max(v);
+        }
+
+        min = (min - 2.0).max(-100.0);
+        max = (max + 2.0).min(0.0);
+        if max - min < MIN_Y_SPAN {
+            let half = MIN_Y_SPAN / 2.0;
+            let mid = ((min + max) / 2.0).clamp(-100.0 + half, -half);
+            min = mid - half;
+            max = mid + half;
+        }
+        [min, max]
     }
 
-    Some(Bounds {
-        x: Range {
-            min: x_min,
-            max: x_max,
-        },
-        y: Range {
-            min: y_min,
-            max: y_max,
-        },
-    })
+    fn points(&self) -> Vec<(f64, f64)> {
+        self.data
+            .iter()
+            .map(|&(t, v)| (t.as_secs_f64(), v as f64))
+            .collect()
+    }
 }
 
-#[derive(Debug, Default)]
-enum ScaleMode {
-    #[default]
-    Highlight,
-    Compare,
+/// Identifies a network. SSID alone is too ambiguous.
+type WifiInfo = ConnectedAp;
+
+/// What the fast sampler is currently able to do for the selected network.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FastStatus {
+    Sampling { rate_hz: f64 },
+    NotConnected,
+    Unsupported,
+    Error(String),
 }
 
-impl std::fmt::Display for ScaleMode {
+impl std::fmt::Display for FastStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScaleMode::Compare => write!(f, "Compare"),
-            ScaleMode::Highlight => write!(f, "Highlight"),
+            FastStatus::Sampling { rate_hz } => write!(f, "Sampling @ {rate_hz:.1} Hz"),
+            FastStatus::NotConnected => write!(
+                f,
+                "not connected to this AP - only the connected AP can be sampled fast"
+            ),
+            FastStatus::Unsupported => write!(f, "fast sampling unsupported on this platform"),
+            FastStatus::Error(e) => write!(f, "error: {e}"),
         }
     }
+}
+
+#[derive(Debug)]
+enum FastCommand {
+    Shutdown,
+}
+
+/// What clicking a legend entry does.
+#[derive(Debug, Clone, Copy)]
+enum LegendAction {
+    Quit,
+    CycleWindow,
 }
 
 #[derive(Debug)]
@@ -196,15 +158,14 @@ pub struct App {
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     time_reference: SystemTime,
-    table_state: TableState,
-    detected_wifis: WifiScanResult,
-    history: HistoryType,
-    debug_text: String,
-    scale_mode: ScaleMode,
-    show_popup: Arc<AtomicBool>,
-    fast_buffer: Vec<(Duration, i32)>,
-    fast_scan_target_ssid: Option<String>,
-    fast_aquisition_thread: Option<tokio::task::JoinHandle<()>>,
+    samples: SampleWindow,
+    window_idx: usize,
+    fast_target: Option<WifiInfo>,
+    generation: u64,
+    fast_status: FastStatus,
+    fast_tx: Option<mpsc::Sender<FastCommand>>,
+    /// Screen regions of the keybind legend, recomputed on every draw since the layout can resize.
+    legend_hitboxes: Vec<(Rect, LegendAction)>,
 }
 
 impl App {
@@ -215,18 +176,13 @@ impl App {
             event_rx: rx,
             event_tx: tx,
             time_reference: SystemTime::now(),
-            table_state: TableState::default(),
-            detected_wifis: WifiScanResult {
-                timestamp: Duration::ZERO,
-                wifi: Ok(Vec::new()),
-            },
-            history: HashMap::new(),
-            debug_text: String::new(),
-            scale_mode: Default::default(),
-            show_popup: Arc::new(AtomicBool::new(false)),
-            fast_buffer: Vec::new(),
-            fast_scan_target_ssid: None,
-            fast_aquisition_thread: None,
+            samples: SampleWindow::new(Duration::from_secs(WIN_PRESETS[DEFAULT_WINDOW])),
+            window_idx: DEFAULT_WINDOW,
+            fast_target: None,
+            generation: 0,
+            fast_status: FastStatus::NotConnected,
+            fast_tx: None,
+            legend_hitboxes: Vec::new(),
         }
     }
 
@@ -234,450 +190,359 @@ impl App {
         self.event_tx.clone()
     }
 
-    fn start_threads(&self) {
+    fn start_threads(&mut self) {
+        self.start_fast_sampler_thread();
+        self.start_tick_thread();
+    }
+
+    fn start_fast_sampler_thread(&mut self) {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<FastCommand>();
+        self.fast_tx = Some(cmd_tx);
+
         thread::spawn({
             let event_tx = self.event_tx.clone();
-            let time_reference = self.time_reference;
+            move || fast_sampler(cmd_rx, event_tx)
+        });
+    }
+
+    fn start_tick_thread(&self) {
+        thread::spawn({
+            let event_tx = self.event_tx.clone();
             move || {
-                loop {
-                    let wifi_scan_result = wifi_scan::scan();
-                    event_tx
-                        .send(Event::WifiScanned(WifiScanResult {
-                            timestamp: time_reference.elapsed().unwrap(),
-                            wifi: wifi_scan_result.map_err(|e| e.to_string()),
-                        }))
-                        .unwrap();
-                    sleep(Duration::from_millis(200));
+                while event_tx.send(Event::Tick).is_ok() {
+                    sleep(TICK_INTERVAL);
                 }
             }
         });
     }
 
-    async fn run_once(&mut self) -> color_eyre::eyre::Result<()> {
-        if let Ok(event) = self.event_rx.recv()
-            && let Some(new) = self.handle_event(event).await
-        {
-            new.into_iter().for_each(|e| self.event_tx.send(e).unwrap());
+    fn run_once(&mut self) -> color_eyre::eyre::Result<()> {
+        if let Ok(event) = self.event_rx.recv() {
+            self.handle_event(event);
         }
         Ok(())
     }
 
-    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::eyre::Result<()> {
         self.start_threads();
         while !self.exit {
             terminal.draw(|f| self.draw(f))?;
-            self.run_once().await?;
+            self.run_once()?;
         }
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: Event) -> Option<Vec<Event>> {
+    fn handle_event(&mut self, event: Event) {
         match event {
             Event::Quit => {
+                if let Some(tx) = &self.fast_tx {
+                    let _ = tx.send(FastCommand::Shutdown);
+                }
                 self.exit = true;
-                None
             }
-            Event::SelectPrev => {
-                self.table_state.select_previous();
-                None
+            Event::Tick => {}
+            Event::FastTarget { target, generation } => {
+                self.generation = generation;
+                self.fast_target = target;
+                self.samples.clear();
             }
-            Event::SelectNext => {
-                self.table_state.select_next();
-                None
-            }
-            Event::WifiScanned(v) => {
-                self.detected_wifis = v;
-                if let Ok(wifi) = &mut self.detected_wifis.wifi {
-                    wifi.sort_by_key(|b| std::cmp::Reverse(b.signal_level));
+            Event::FastSample { generation, dbm } => {
+                // A sample still in flight from a previous target must not land in the new buffer.
+                if generation == self.generation {
+                    self.samples
+                        .push(self.time_reference.elapsed().unwrap_or_default(), dbm);
                 }
+            }
+            Event::FastStatus(status) => self.fast_status = status,
+            Event::CycleWindow => self.cycle_window(),
+            Event::Click { x, y } => self.handle_click(x, y),
+        }
+    }
 
-                if let Ok(wifi) = &self.detected_wifis.wifi {
-                    wifi.iter().for_each(|w| {
-                        let dp = Datapoint::new(
-                            self.time_reference.elapsed().unwrap(),
-                            Some(w.signal_level),
-                        );
-                        self.history
-                            .entry(w.into())
-                            .and_modify(|value| value.push(dp.clone()))
-                            .or_insert(DataPointContainer { data: vec![dp] });
-                    });
-                }
-                let longest_history_n = self.history.values().map(|v| v.data.len()).max();
-                if let Some(max_n) = longest_history_n {
-                    self.history.values_mut().for_each(|v| {
-                        if v.data.len() < max_n {
-                            v.data.push(Datapoint {
-                                timestamp: self.time_reference.elapsed().unwrap(),
-                                signal_strength: None,
-                            });
-                        }
-                    });
+    fn cycle_window(&mut self) {
+        self.window_idx = (self.window_idx + 1) % WIN_PRESETS.len();
+        self.samples
+            .set_window(Duration::from_secs(WIN_PRESETS[self.window_idx]));
+    }
 
-                    let matched_length = self.history.values().all(|v| v.data.len() == max_n);
-                    self.debug_text = if matched_length == false {
-                        format!(
-                            "Max_len: {max_n} | {}",
-                            self.history
-                                .iter()
-                                .map(|(k, v)| {
-                                    format!("{} ({}): {}", k.ssid, k.mac, v.data.len() == max_n)
-                                })
-                                .collect::<Vec<String>>()
-                                .join(", ")
-                        )
-                    } else {
-                        String::new()
-                    };
+    fn handle_click(&mut self, x: u16, y: u16) {
+        let point = ratatui::layout::Position { x, y };
+        let Some(&(_, action)) = self
+            .legend_hitboxes
+            .iter()
+            .find(|(rect, _)| rect.contains(point))
+        else {
+            return;
+        };
 
-                    // assert!(self.history.values().all(|v| v.data.len() == max_n));
-                }
-                None
-            }
-            Event::SelectColPrev => {
-                self.table_state.select_previous_column();
-                None
-            }
-            Event::SelectColNext => {
-                self.table_state.select_next_column();
-                None
-            }
-            Event::CycleScaleMode => {
-                self.scale_mode = match self.scale_mode {
-                    ScaleMode::Compare => ScaleMode::Highlight,
-                    ScaleMode::Highlight => ScaleMode::Compare,
-                };
-                None
-            }
-            Event::TogglePopup => {
-                if self.table_state.selected().is_none() {
-                    return None;
-                }
-                self.show_popup
-                    .store(!self.show_popup.load(Ordering::Relaxed), Ordering::Relaxed);
-                self.fast_scan_target_ssid = Some(
-                    self.detected_wifis
-                        .wifi
-                        .as_ref()
-                        .unwrap()
-                        .get(self.table_state.selected().unwrap())
-                        .unwrap()
-                        .ssid
-                        .clone(),
-                );
-                match self.show_popup.load(Ordering::Relaxed) {
-                    true => {
-                        self.fast_aquisition_thread = Some(tokio::spawn({
-                            let run_condition = self.show_popup.clone();
-                            let event_tx = self.event_sender();
-                            let ssid = self.fast_scan_target_ssid.clone().unwrap();
-                            async move {
-                                while run_condition.load(Ordering::Relaxed) {
-                                    if let Some(sample) = scan_single_ssid_fast(ssid.as_str()).await
-                                    {
-                                        event_tx
-                                            .send(Event::FastScanMeasurement(
-                                                sample.signal_strength,
-                                            ))
-                                            .unwrap();
-                                    }
-                                    sleep(Duration::from_millis(100));
-                                }
-                            }
-                        }));
-                    }
-                    false => {
-                        if let Some(thread) = &mut self.fast_aquisition_thread {
-                            let _ = thread.await.unwrap();
-                            self.fast_aquisition_thread = None;
-                        }
-                        self.fast_scan_target_ssid = None;
-                        self.fast_buffer.clear();
-                    }
-                }
-
-                None
-            }
-            Event::FastScanMeasurement(value) => {
-                self.fast_buffer
-                    .push((self.time_reference.elapsed().unwrap(), value));
-                None
-            }
+        match action {
+            LegendAction::Quit => self.handle_event(Event::Quit),
+            LegendAction::CycleWindow => self.cycle_window(),
         }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let mut items = match &self.detected_wifis.wifi {
-            Ok(wifi) => wifi
-                .iter()
-                .map(|e| e.ssid.to_string())
-                .collect::<Vec<String>>(),
-            Err(e) => {
-                vec![e.clone()]
-            }
-        };
-
-        let ts = time_format::from_system_time(self.time_reference + self.detected_wifis.timestamp)
-            .unwrap();
-        let formatted_time = time_format::format_iso8601_local(ts).unwrap();
-        items.push(formatted_time.to_string());
-
-        let [
-            table_area,
-            chart_area,
-            current_charted_area,
-            debug_area,
-            app_debug_area,
-        ] = Layout::default()
+        let [chart_area, status_area, error_area, legend_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-                Constraint::Min(1),
-                Constraint::Min(5),
-                Constraint::Min(5),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .areas(frame.area());
 
-        let table_rows: Vec<Row> = match &self.detected_wifis.wifi {
-            Ok(wifi) => wifi
-                .iter()
-                .map(|e| {
-                    Row::new(vec![
-                        e.ssid.to_string(),
-                        e.mac.to_string(),
-                        e.channel.to_string(),
-                        e.signal_level.to_string(),
-                    ])
-                })
-                .collect::<Vec<Row>>(),
-            Err(_) => Vec::new(),
+        self.draw_chart(frame, chart_area);
+
+        let target = self
+            .fast_target
+            .as_ref()
+            .map(|t| format!("{} [{}]", t.ssid, t.mac))
+            .unwrap_or_else(|| "no network connected".to_string());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} | {} | n={} | window={}s",
+                target,
+                self.fast_status,
+                self.samples.len(),
+                WIN_PRESETS[self.window_idx],
+            ))
+            .bold()
+            .cyan(),
+            status_area,
+        );
+
+        let error = match &self.fast_status {
+            FastStatus::Error(e) => e.clone(),
+            _ => String::new(),
         };
-        let widths = [
-            Constraint::Min(30),
-            Constraint::Min(11),
-            Constraint::Min(10),
-            Constraint::Min(16),
+        frame.render_widget(Paragraph::new(error).red().italic(), error_area);
+
+        self.draw_legend(frame, legend_area);
+    }
+
+    /// A bottom keybind bar in the style of htop's function-key legend. Each entry is also a
+    /// clickable button, so hitboxes are recorded in `legend_hitboxes` as they're laid out.
+    fn draw_legend(&mut self, frame: &mut Frame, area: Rect) {
+        const KEYBINDS: [(&str, &str, LegendAction); 2] = [
+            ("w", "cycle window", LegendAction::CycleWindow),
+            ("q", "quit", LegendAction::Quit),
         ];
 
-        let footer_str = match &self.detected_wifis.wifi {
-            Ok(_) => format!("Updated on {}", formatted_time),
-            Err(e) => format!("Updated on {} | {}", formatted_time, e),
-        };
-        let table = Table::new(table_rows.clone(), widths)
-            .column_spacing(1)
-            .style(Style::new().blue())
-            .header(
-                Row::new(vec!["SSID", "MAC", "Channel", "Signal strength"])
-                    .style(Style::new().bold())
-                    .bottom_margin(1),
-            )
-            .footer(Row::new(vec![footer_str]))
-            .block(
-                Block::new()
-                    .title("Wifi networks nearby")
-                    .borders(Borders::ALL),
-            )
-            .row_highlight_style(Style::new().reversed())
-            .column_highlight_style(Style::new().red())
-            .cell_highlight_style(Style::new().blue())
-            .highlight_symbol(">>");
-        if self.table_state.selected().is_none() {
-            self.table_state.select(Some(0));
+        let key_style = Style::new().black().on_cyan();
+        let label_style = Style::new().cyan();
+
+        self.legend_hitboxes.clear();
+        let mut spans = Vec::with_capacity(KEYBINDS.len() * 3);
+        let mut col = area.x;
+        for (key, label, action) in KEYBINDS {
+            let entry = format!(" {key} {label} ");
+            let width = entry.chars().count() as u16;
+            self.legend_hitboxes
+                .push((Rect::new(col, area.y, width, 1), action));
+            col += width + 1;
+
+            spans.push(Span::styled(format!(" {key} "), key_style));
+            spans.push(Span::styled(format!("{label} "), label_style));
+            spans.push(Span::raw(" "));
         }
-        frame.render_stateful_widget(table, table_area, &mut self.table_state);
 
-        let selected_wifi = if let Some(s) = self.table_state.selected()
-            && let Ok(wifi) = &self.detected_wifis.wifi
-        {
-            wifi.get(s)
-        } else {
-            None
-        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 
-        let history_element = match &selected_wifi {
-            Some(wifi) => self.history.get(&(*wifi).into()),
-            None => None,
-        };
-        let data = match history_element {
-            Some(element) => element
-                .get_data()
-                .clone()
-                .into_iter()
-                .map(|p| p.into())
-                .collect::<Vec<(f64, f64)>>(),
-            None => Vec::new(),
-        };
+    fn draw_chart(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let data = self.samples.points();
         let datasets = vec![
             Dataset::default()
-                .name("Wifi signal strengh")
+                .name("Signal strength")
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().magenta())
                 .data(&data),
         ];
 
-        let (x_bounds, y_bounds) = match self.scale_mode {
-            ScaleMode::Compare => {
-                let db = find_bounds(&self.history).unwrap_or_default();
-                ([db.x.min, db.x.max], [db.y.min, db.y.max])
-            }
-            ScaleMode::Highlight => (
-                history_element
-                    .and_then(|el| el.get_limits_x())
-                    .unwrap_or([0.0, 10.0]),
-                history_element
-                    .and_then(|el| el.get_limits_y())
-                    .unwrap_or([0.0, 10.0]),
-            ),
-        };
+        let x_bounds = self.samples.bounds_x();
+        let y_bounds = self.samples.bounds_y();
+        let window = WIN_PRESETS[self.window_idx];
 
-        let x_labels = x_bounds
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<String>>();
-        let y_labels = y_bounds
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<String>>();
-
+        // The x axis scrolls with the newest sample, so label it relative to "now".
         let x_axis = Axis::default()
             .title("Time".red())
             .style(Style::default().white())
             .bounds(x_bounds)
-            .labels(x_labels);
+            .labels([format!("-{window}s"), format!("-{}s", window / 2), "now".to_string()]);
 
-        // Create the Y axis and define its properties
         let y_axis = Axis::default()
             .title("Signal strength dBm".red())
             .style(Style::default().white())
-            // .bounds([-100.0, 0.0])
-            // .labels(["-100.0", "-50.0", "0.0"]);
             .bounds(y_bounds)
-            .labels(y_labels);
+            .labels([
+                format!("{:.0}", y_bounds[0]),
+                format!("{:.0}", (y_bounds[0] + y_bounds[1]) / 2.0),
+                format!("{:.0}", y_bounds[1]),
+            ]);
+
+        let title = match &self.fast_target {
+            Some(t) => format!("{} [{}]", t.ssid, t.mac),
+            None => "no network connected".to_string(),
+        };
         let chart = Chart::new(datasets)
-            .block(Block::new().title("Chart"))
+            .block(Block::new().title(title))
             .x_axis(x_axis)
             .y_axis(y_axis);
 
-        frame.render_widget(chart, chart_area);
+        frame.render_widget(chart, area);
+    }
+}
 
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{}, {}, {}",
-                selected_wifi.map(|f| f.ssid.clone()).unwrap_or_default(),
-                self.scale_mode,
-                data.len()
-            ))
-            .bold()
-            .cyan()
-            .centered(),
-            current_charted_area,
-        );
+/// Owns the WLAN session for the lifetime of the app and samples the targeted AP as fast as the
+/// driver allows.
+fn fast_sampler(cmd_rx: mpsc::Receiver<FastCommand>, event_tx: mpsc::Sender<Event>) {
+    let session = WlanSession::open();
 
-        let debug_values = selected_wifi.and_then(|wifi| {
-            self.history.get(&wifi.into()).map(|d| {
-                d.data
-                    .iter()
-                    .map(|i| i.signal_strength.map(|v| v.to_string()).unwrap_or_default())
-                    .collect::<Vec<String>>()
-            })
-        });
-        let debug_values = (x_bounds, y_bounds);
-        frame.render_widget(
-            Paragraph::new(format!("{:?}", debug_values))
-                .yellow()
-                .italic()
-                .wrap(Wrap { trim: true }),
-            debug_area,
-        );
+    let mut target: Option<WifiInfo> = None;
+    let mut generation = 0u64;
+    let mut on_target = false;
+    let mut last_check: Option<Instant> = None;
+    let mut samples_since_check = 0u32;
 
-        frame.render_widget(
-            Paragraph::new(format!("{:?}", self.debug_text))
-                .red()
-                .italic()
-                .wrap(Wrap { trim: true }),
-            app_debug_area,
-        );
+    loop {
+        match cmd_rx.recv_timeout(FAST_SAMPLE_INTERVAL) {
+            Ok(FastCommand::Shutdown) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
 
-        if self.show_popup.load(Ordering::Relaxed) {
-            let popup_block = Block::bordered().title("Popup");
-            let centered_area = frame
-                .area()
-                .centered(Constraint::Percentage(60), Constraint::Percentage(20));
-            // clears out any background in the area before rendering the popup
-            frame.render_widget(Clear, centered_area);
-            // let paragraph = Paragraph::new("Lorem ipsum").block(popup_block);
-            // frame.render_widget(paragraph, centered_area);
+        // Re-checking catches the association changing under us.
+        if last_check.is_none_or(|at| at.elapsed() >= STATUS_CHECK_INTERVAL) {
+            let elapsed = last_check.map(|at| at.elapsed().as_secs_f64());
+            last_check = Some(Instant::now());
 
-            let data = self
-                .fast_buffer
-                .iter()
-                .map(|(duration, value)| (duration.as_secs_f64(), *value as f64))
-                .collect::<Vec<(f64, f64)>>();
+            let (status, connected) = match &session {
+                Err(e) => (FastStatus::Error(e.clone()), None),
+                Ok(session) => match session.connected_ap() {
+                    Some(ap) => {
+                        let measured = match (elapsed, samples_since_check) {
+                            (Some(secs), n) if n > 0 && secs > 0.0 => n as f64 / secs,
+                            _ => 1.0 / FAST_SAMPLE_INTERVAL.as_secs_f64(),
+                        };
+                        (FastStatus::Sampling { rate_hz: measured }, Some(ap))
+                    }
+                    None if FAST_PATH_SUPPORTED => (FastStatus::NotConnected, None),
+                    None => (FastStatus::Unsupported, None),
+                },
+            };
 
-            let datasets = vec![
-                Dataset::default()
-                    .name("Wifi signal strengh")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().yellow())
-                    .data(&data),
-            ];
+            if connected != target {
+                generation += 1;
+                target = connected;
+                if event_tx
+                    .send(Event::FastTarget {
+                        target: target.clone(),
+                        generation,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
 
-            let x_bounds = [0.0, 10.0];
-            let y_bounds = [0.0, 10.0];
+            on_target = matches!(status, FastStatus::Sampling { .. });
+            samples_since_check = 0;
+            if event_tx.send(Event::FastStatus(status)).is_err() {
+                break;
+            }
+        }
 
-            let x_labels = x_bounds
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<String>>();
-
-            let y_labels = y_bounds
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<String>>();
-
-            let x_axis = Axis::default()
-                .title("Time".red())
-                .style(Style::default().white())
-                .bounds(x_bounds)
-                .labels(x_labels);
-
-            // Create the Y axis and define its properties
-            let y_axis = Axis::default()
-                .title("Signal strength dBm".red())
-                .style(Style::default().white())
-                // .bounds([-100.0, 0.0])
-                // .labels(["-100.0", "-50.0", "0.0"]);
-                .bounds(y_bounds)
-                .labels(y_labels);
-
-            let fast_chart = Chart::new(datasets)
-                .block(Block::new().title("Fast Chart"))
-                .x_axis(x_axis)
-                .y_axis(y_axis);
-
-            // another solution is to use the inner area of the block
-            let inner_area = popup_block.inner(centered_area);
-            frame.render_widget(fast_chart, inner_area);
+        if !on_target {
+            continue;
+        }
+        if let Ok(session) = &session
+            && let Some(dbm) = session.rssi()
+        {
+            samples_since_check += 1;
+            let sample = Event::FastSample { generation, dbm };
+            if event_tx.send(sample).is_err() {
+                break;
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod app_test {
+mod sample_window_test {
     use super::*;
 
+    fn secs(s: f64) -> Duration {
+        Duration::from_secs_f64(s)
+    }
+
     #[test]
-    fn run_test() {
-        let mut app = App::new();
-        let _event_tx = app.event_sender();
-        app.start_threads();
-        loop {
-            println!("{:?}", app.history);
-            let _ = app.run_once();
-            sleep(Duration::from_secs_f32(0.1));
+    fn evicts_samples_older_than_the_window() {
+        let mut w = SampleWindow::new(secs(10.0));
+        for i in 0..=20 {
+            w.push(secs(i as f64), -50);
         }
+        // Newest is at t=20, so only t=10..=20 may remain.
+        assert_eq!(w.len(), 11);
+        assert_eq!(w.data.front().unwrap().0, secs(10.0));
+        assert_eq!(w.data.back().unwrap().0, secs(20.0));
+    }
+
+    #[test]
+    fn shrinking_the_window_evicts_immediately() {
+        let mut w = SampleWindow::new(secs(60.0));
+        for i in 0..=20 {
+            w.push(secs(i as f64), -50);
+        }
+        assert_eq!(w.len(), 21);
+        w.set_window(secs(5.0));
+        assert_eq!(w.len(), 6);
+    }
+
+    #[test]
+    fn bounds_x_scrolls_at_constant_width() {
+        let mut w = SampleWindow::new(secs(30.0));
+        w.push(secs(100.0), -50);
+        assert_eq!(w.bounds_x(), [70.0, 100.0]);
+    }
+
+    #[test]
+    fn bounds_y_widens_in_both_directions() {
+        let mut w = SampleWindow::new(secs(60.0));
+        // Both later values extend the range that the first one seeded, one in each direction.
+        for v in [-50, -70, -30] {
+            w.push(secs(0.0), v);
+        }
+        assert_eq!(w.bounds_y(), [-72.0, -28.0]);
+    }
+
+    #[test]
+    fn bounds_y_enforces_a_minimum_span() {
+        let mut w = SampleWindow::new(secs(60.0));
+        w.push(secs(0.0), -60);
+        let [min, max] = w.bounds_y();
+        assert!((max - min - MIN_Y_SPAN).abs() < f64::EPSILON, "{min}..{max}");
+        assert!(min >= -100.0 && max <= 0.0);
+    }
+
+    #[test]
+    fn bounds_y_stays_inside_the_dbm_range() {
+        let mut w = SampleWindow::new(secs(60.0));
+        w.push(secs(0.0), -100);
+        w.push(secs(1.0), -99);
+        let [min, max] = w.bounds_y();
+        assert!(min >= -100.0 && max <= 0.0, "{min}..{max}");
+        assert!(max - min >= MIN_Y_SPAN);
+    }
+
+    #[test]
+    fn clear_empties_the_series() {
+        let mut w = SampleWindow::new(secs(30.0));
+        w.push(secs(1.0), -50);
+        w.clear();
+        assert_eq!(w.len(), 0);
+        assert!(w.points().is_empty());
+        assert_eq!(w.bounds_y(), [-100.0, 0.0]);
     }
 }

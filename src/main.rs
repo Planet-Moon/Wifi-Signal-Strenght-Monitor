@@ -2,14 +2,18 @@ mod app;
 mod event;
 mod wifi;
 
+use std::io;
 use std::thread;
+
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 
 use crate::app::App;
 
-#[tokio::main]
-pub async fn main() -> color_eyre::eyre::Result<()> {
+pub fn main() -> color_eyre::eyre::Result<()> {
     color_eyre::install()?;
     let mut terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture)?;
     let mut app = App::new();
 
     thread::spawn({
@@ -21,8 +25,9 @@ pub async fn main() -> color_eyre::eyre::Result<()> {
         }
     });
 
-    let app_result = app.run(&mut terminal).await;
+    let app_result = app.run(&mut terminal);
 
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
     app_result
 }
